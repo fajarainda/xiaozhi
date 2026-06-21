@@ -312,7 +312,7 @@ void Application::HandleActivationDoneEvent() {
     // Release OTA object after activation is complete
     ota_.reset();
     auto& board = Board::GetInstance();
-    board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+    board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
 
     Schedule([this]() {
         // Play the success sound to indicate the device is ready
@@ -510,13 +510,29 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->OnAudioChannelClosed([this, &board]() {
-        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
-        Schedule([this]() {
-            auto display = Board::GetInstance().GetDisplay();
-            display->SetChatMessage("system", "");
-            SetDeviceState(kDeviceStateIdle);
-        });
+    board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    Schedule([this]() {
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetChatMessage("system", "");
+        SetDeviceState(kDeviceStateIdle);
+
+        if (auto_reconnect_ && protocol_) {
+            xTaskCreate([](void* arg) {
+                Application* app = static_cast<Application*>(arg);
+                vTaskDelay(pdMS_TO_TICKS(1500));
+                app->Schedule([app]() {
+                    if (app->GetDeviceState() == kDeviceStateIdle && app->protocol_) {
+                        if (!app->protocol_->IsAudioChannelOpened()) {
+                            ESP_LOGI(TAG, "Auto-reconnecting audio channel...");
+                            app->protocol_->OpenAudioChannel(); // tanpa Start()
+                        }
+                    }
+                });
+                vTaskDelete(NULL);
+            }, "auto_reconnect", 4096, this, 5, nullptr);
+        }
     });
+});
     
     protocol_->OnIncomingJson([this, display](const cJSON* root) {
         // Parse JSON data
@@ -526,13 +542,22 @@ void Application::InitializeProtocol() {
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
                     aborted_ = false;
+                    if (GetDeviceState() == kDeviceStateIdle) {
+                        is_push_tts_ = true;
+                    }
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
-                        if (listening_mode_ == kListeningModeManualStop) {
+                        if (is_push_tts_ || listening_mode_ == kListeningModeManualStop) {
+                            is_push_tts_ = false;
                             SetDeviceState(kDeviceStateIdle);
+                            // Tutup channel agar OnAudioChannelClosed terpanggil
+                            // dan auto_reconnect bisa berjalan kembali
+                            if (protocol_ && protocol_->IsAudioChannelOpened()) {
+                                protocol_->CloseAudioChannel();
+                            }
                         } else {
                             SetDeviceState(kDeviceStateListening);
                         }
@@ -607,6 +632,14 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->Start();
+
+    // Buka audio channel otomatis setelah boot, tanpa menunggu trigger user
+    Schedule([this]() {
+        if (protocol_ && !protocol_->IsAudioChannelOpened()) {
+            ESP_LOGI(TAG, "Auto-opening audio channel after boot...");
+            protocol_->OpenAudioChannel();
+        }
+    });
 }
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {
@@ -1113,4 +1146,3 @@ void Application::ResetProtocol() {
         protocol_.reset();
     });
 }
-
