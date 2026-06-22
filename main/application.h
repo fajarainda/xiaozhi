@@ -142,6 +142,7 @@ private:
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     bool auto_reconnect_ = true;
     bool is_push_tts_ = false;
+    bool is_reconnecting_ = false;  // Guard agar task reconnect tidak numpuk/overlap
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 

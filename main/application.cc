@@ -510,29 +510,38 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->OnAudioChannelClosed([this, &board]() {
-    board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
-    Schedule([this]() {
-        auto display = Board::GetInstance().GetDisplay();
-        display->SetChatMessage("system", "");
-        SetDeviceState(kDeviceStateIdle);
+        board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+        Schedule([this]() {
+            auto display = Board::GetInstance().GetDisplay();
+            display->SetChatMessage("system", "");
+            SetDeviceState(kDeviceStateIdle);
 
-        if (auto_reconnect_ && protocol_) {
-            xTaskCreate([](void* arg) {
-                Application* app = static_cast<Application*>(arg);
-                vTaskDelay(pdMS_TO_TICKS(1500));
-                app->Schedule([app]() {
+            // Guard: jangan bikin task reconnect baru kalau yang sebelumnya
+            // masih berjalan. Tanpa ini, tiap channel ketutup bisa memicu
+            // task baru yang numpuk dan saling rebutan koneksi.
+            if (auto_reconnect_ && protocol_ && !is_reconnecting_) {
+                is_reconnecting_ = true;
+                xTaskCreate([](void* arg) {
+                    Application* app = static_cast<Application*>(arg);
+                    vTaskDelay(pdMS_TO_TICKS(1500));
+                    // PENTING: OpenAudioChannel() dipanggil di task terpisah
+                    // ini, BUKAN lewat app->Schedule(). OpenAudioChannel()
+                    // blocking sampai handshake WS selesai/timeout — kalau
+                    // dijalankan lewat Schedule(), itu akan menyumbat main
+                    // task sehingga event wake word tidak terproses selama
+                    // proses koneksi berlangsung.
                     if (app->GetDeviceState() == kDeviceStateIdle && app->protocol_) {
                         if (!app->protocol_->IsAudioChannelOpened()) {
                             ESP_LOGI(TAG, "Auto-reconnecting audio channel...");
                             app->protocol_->OpenAudioChannel(); // tanpa Start()
                         }
                     }
-                });
-                vTaskDelete(NULL);
-            }, "auto_reconnect", 4096, this, 5, nullptr);
-        }
+                    app->is_reconnecting_ = false;
+                    vTaskDelete(NULL);
+                }, "auto_reconnect", 4096, this, 5, nullptr);
+            }
+        });
     });
-});
     
     protocol_->OnIncomingJson([this, display](const cJSON* root) {
         // Parse JSON data
@@ -828,8 +837,14 @@ void Application::HandleWakeWordDetectedEvent() {
             });
             return;
         }
-        // Channel already opened, continue directly
-        ContinueWakeWordInvoke(wake_word);
+        // Channel already opened (misalnya oleh auto-reconnect keep-alive).
+        // ContinueWakeWordInvoke() mensyaratkan state == kDeviceStateConnecting
+        // sebelum lanjut, jadi state harus ditransisikan ke Connecting juga di
+        // jalur ini, bukan cuma di jalur channel-belum-terbuka di atas.
+        SetDeviceState(kDeviceStateConnecting);
+        Schedule([this, wake_word]() {
+            ContinueWakeWordInvoke(wake_word);
+        });
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
         AbortSpeaking(kAbortReasonWakeWordDetected);
         // Clear send queue to avoid sending residues to server
